@@ -6,12 +6,18 @@ import tempfile
 from contextlib import closing
 from dataclasses import asdict, replace
 from pathlib import Path
+from typing import TextIO
 
 from qr_video import __version__
 from qr_video.envelope import EnvelopeInfo, decode_envelope, encode_envelope
 from qr_video.errors import QRVideoError
 from qr_video.profiles import CONSERVATIVE, Profile
-from qr_video.safeio import atomic_output, check_output, generate_key, read_key
+from qr_video.safeio import (
+    atomic_output,
+    check_output,
+    generate_key,
+    read_key,
+)
 from qr_video.transport import (
     DEFAULT_MAX_BYTES,
     Manifest,
@@ -24,6 +30,61 @@ from qr_video.transport import (
 from qr_video.video import read_video, write_video
 
 
+class _Progress:
+    def __init__(
+        self,
+        label: str,
+        unit: str,
+        *,
+        total: int | None = None,
+        stream: TextIO | None = None,
+    ) -> None:
+        self.label = label
+        self.unit = unit
+        self.total = total
+        self.stream = sys.stderr if stream is None else stream
+        self.enabled = self.stream.isatty()
+        self._width = 0
+        if self.enabled:
+            self.update(0)
+
+    def update(self, completed: int) -> None:
+        if not self.enabled:
+            return
+        if self.total is None:
+            marker = "|/-\\"[completed % 4]
+            message = f"{self.label}: {marker} {completed} {self.unit}"
+        else:
+            bounded = min(completed, self.total)
+            percent = 100 * bounded // self.total
+            message = f"{self.label}: {percent:3d}% ({bounded}/{self.total} {self.unit})"
+        self._width = max(self._width, len(message))
+        self.stream.write(f"\r{message:<{self._width}}")
+        self.stream.flush()
+
+    def close(self) -> None:
+        if self.enabled:
+            self.stream.write("\n")
+            self.stream.flush()
+
+
+def _inline_key(value: str) -> bytes:
+    key = value.encode("utf-8")
+    if not key:
+        raise argparse.ArgumentTypeError("key must not be empty")
+    return key
+
+
+def _add_key_arguments(command: argparse.ArgumentParser) -> None:
+    keys = command.add_mutually_exclusive_group()
+    keys.add_argument(
+        "--key",
+        type=_inline_key,
+        help="Use a non-empty key directly (encoded as UTF-8)",
+    )
+    keys.add_argument("--key-file", type=Path, help="Read a non-empty raw key from a file")
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="qr-video",
@@ -31,7 +92,9 @@ def parser() -> argparse.ArgumentParser:
     )
     root.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     commands = root.add_subparsers(dest="command", required=True)
-    keygen = commands.add_parser("keygen", help="Create a private 32-byte random key file")
+    keygen = commands.add_parser(
+        "keygen", help="Create a private 32-character alphanumeric key file"
+    )
     keygen.add_argument("--out", required=True, type=Path, help="New key path, never overwritten")
     for command in ("encode", "stats"):
         help_text = (
@@ -41,7 +104,7 @@ def parser() -> argparse.ArgumentParser:
         )
         sub = commands.add_parser(command, help=help_text)
         sub.add_argument("input", type=Path, help="Local binary input file")
-        sub.add_argument("--key-file", type=Path, help="Encrypt with a 32-byte key file")
+        _add_key_arguments(sub)
         sub.add_argument(
             "--compress", action="store_true", help="Compress with zlib before encryption"
         )
@@ -64,7 +127,7 @@ def parser() -> argparse.ArgumentParser:
     decode = commands.add_parser("decode", help="Recover a binary file from a local video")
     decode.add_argument("input", type=Path, help="Local input video")
     decode.add_argument("--out", required=True, type=Path, help="Recovered binary output path")
-    decode.add_argument("--key-file", type=Path, help="Key file required for encrypted videos")
+    _add_key_arguments(decode)
     decode.add_argument(
         "--overwrite", action="store_true", help="Replace output only after verification"
     )
@@ -84,7 +147,8 @@ def _input_and_key(args: argparse.Namespace) -> tuple[Path, bytes | None]:
     key_file: Path | None = args.key_file
     if key_file is not None and key_file.exists() and source.samefile(key_file):
         raise QRVideoError("Input and key file must be different files")
-    return source, read_key(key_file) if key_file is not None else None
+    key: bytes | None = args.key
+    return source, read_key(key_file) if key_file is not None else key
 
 
 def _profile(args: argparse.Namespace) -> Profile:
@@ -151,9 +215,17 @@ def _encode_or_stats(args: argparse.Namespace) -> None:
             return
         print(json.dumps(stats, sort_keys=True), file=sys.stderr, flush=True)
         video = workspace / "video.mp4"
-        images = write_video(
-            encode_packets(envelope, manifest), video, profile=profile, crf=args.crf
-        )
+        progress = _Progress("Encoding", "QR images", total=int(stats["images"]))
+        try:
+            images = write_video(
+                encode_packets(envelope, manifest),
+                video,
+                profile=profile,
+                crf=args.crf,
+                on_progress=progress.update,
+            )
+        finally:
+            progress.close()
         if images != stats["images"]:
             raise QRVideoError("Video image count does not match the transport schedule")
         with (
@@ -172,8 +244,12 @@ def _decode(args: argparse.Namespace) -> None:
     _check_destination(args, source)
     with tempfile.TemporaryDirectory(prefix="qr-video-decode-") as directory:
         envelope = Path(directory).resolve() / "stream.qve"
-        with closing(read_video(source)) as observations:
-            _, recovery = recover_stream(observations, envelope, max_bytes=args.max_bytes)
+        progress = _Progress("Decoding", "video frames")
+        try:
+            with closing(read_video(source, on_progress=progress.update)) as observations:
+                _, recovery = recover_stream(observations, envelope, max_bytes=args.max_bytes)
+        finally:
+            progress.close()
         info = decode_envelope(
             envelope,
             args.out,

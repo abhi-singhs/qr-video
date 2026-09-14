@@ -89,8 +89,8 @@ class EnvelopeInfo:
 
 
 def _validate_key(key: bytes | None) -> None:
-    if key is not None and (not isinstance(key, bytes) or len(key) != KEY_SIZE):
-        raise QRVideoError(f"Encryption key must be exactly {KEY_SIZE} raw bytes.")
+    if key is not None and (not isinstance(key, bytes) or not key):
+        raise QRVideoError("Encryption key must be non-empty bytes.")
 
 
 def _cipher(key: bytes | None, salt: bytes) -> AESGCM | None:
@@ -242,7 +242,7 @@ def decode_envelope(
             encrypted = bool(flags & FLAG_ENCRYPTED)
             compressed = bool(flags & FLAG_COMPRESSED)
             if encrypted and key is None:
-                raise QRVideoError("This encrypted envelope requires a 32-byte key.")
+                raise QRVideoError("This encrypted envelope requires a key.")
             if not encrypted and key is not None:
                 raise QRVideoError("A key was supplied for an unencrypted envelope.")
             cipher = _cipher(key, salt)

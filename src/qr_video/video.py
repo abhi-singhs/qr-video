@@ -3,19 +3,14 @@ import os
 import shutil
 import subprocess
 import threading
-from collections.abc import Generator, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import suppress
-from itertools import zip_longest
 from pathlib import Path
 from typing import IO, Any
 
 import numpy as np
-import qrcode
-import qrcode.base
 import zxingcpp
 from numpy.typing import NDArray
-from qrcode.exceptions import DataOverflowError
-from qrcode.util import MODE_8BIT_BYTE, BitBuffer, QRData, create_bytes
 
 from qr_video.errors import QRVideoError
 from qr_video.profiles import CONSERVATIVE, Profile
@@ -26,40 +21,6 @@ _STDERR_LIMIT = 65536
 _PROCESS_TIMEOUT = 60
 _INPUT_FORMATS = "mov,matroska,webm,avi,mpegts"
 GrayFrame = NDArray[np.uint8]
-
-
-def _zero_safe_codewords(packet: bytes, profile: Profile) -> list[int]:
-    # qrcode 8 raises glog(0) for an all-zero Reed-Solomon data block.
-    blocks = qrcode.base.rs_blocks(profile.version, qrcode.constants.ERROR_CORRECT_H)
-    capacity = sum(block.data_count for block in blocks)
-    buffer = BitBuffer()
-    buffer.put(MODE_8BIT_BYTE, 4)
-    buffer.put(len(packet), 16)
-    QRData(packet, mode=MODE_8BIT_BYTE).write(buffer)
-    buffer.put(0, 4)
-    for index in range(capacity - len(buffer.buffer)):
-        buffer.put(0xEC if index % 2 == 0 else 0x11, 8)
-    data: list[list[int]] = []
-    parity: list[list[int]] = []
-    offset = 0
-    for block in blocks:
-        count = block.data_count
-        chunk = BitBuffer()
-        chunk.buffer = buffer.buffer[offset : offset + count]
-        offset += count
-        if any(chunk.buffer):
-            encoded = create_bytes(chunk, [block])
-            parity.append(encoded[count:])
-        else:
-            parity.append([0] * (block.total_count - count))
-        data.append(chunk.buffer)
-    return [
-        value
-        for group in (data, parity)
-        for column in zip_longest(*group)
-        for value in column
-        if value is not None
-    ]
 
 
 def _validate_profile(profile: Profile) -> None:
@@ -87,25 +48,24 @@ def _render_qr(packet: bytes, profile: Profile) -> GrayFrame:
         raise QRVideoError(
             f"QR packet contains {len(packet)} bytes; maximum is {profile.qr_capacity}"
         )
-    qr = qrcode.QRCode(
-        version=profile.version,
-        error_correction=qrcode.constants.ERROR_CORRECT_H,
-        box_size=profile.pixels_per_module,
-        border=4,
-    )
-    qr.add_data(QRData(packet, mode=MODE_8BIT_BYTE), optimize=0)
     try:
-        qr.make(fit=False)
-    except DataOverflowError as error:
-        raise QRVideoError("QR packet exceeds the fixed byte-mode capacity") from error
-    except ValueError as error:
-        if str(error) != "glog(0)":
-            raise QRVideoError(f"Could not encode the QR packet. {error}") from error
-        qr.data_cache = _zero_safe_codewords(packet, profile)
-        qr.make(fit=False)
-    image = np.asarray(
-        qr.make_image(fill_color="black", back_color="white").convert("L"), dtype=np.uint8
-    )
+        barcode = zxingcpp.create_barcode(
+            packet,
+            zxingcpp.BarcodeFormat.QRCode,
+            ec_level="H",
+            version=profile.version,
+            eci=False,
+        )
+        image = np.asarray(
+            zxingcpp.write_barcode_to_image(
+                barcode,
+                scale=profile.pixels_per_module,
+                add_quiet_zones=True,
+            ),
+            dtype=np.uint8,
+        )
+    except (RuntimeError, ValueError) as error:
+        raise QRVideoError(f"Could not encode the QR packet. {error}") from error
     if image.shape != (profile.side, profile.side):
         raise QRVideoError("QR image dimensions do not match the conservative profile")
     return image
@@ -237,6 +197,7 @@ def write_video(
     *,
     profile: Profile = CONSERVATIVE,
     crf: int = 18,
+    on_progress: Callable[[int], None] | None = None,
 ) -> int:
     _validate_profile(profile)
     if type(crf) is not int or not 0 <= crf <= 51:
@@ -292,6 +253,8 @@ def write_video(
             for _ in range(profile.repeat):
                 process.write(frame)
             count += 1
+            if on_progress is not None:
+                on_progress(count)
             try:
                 left = next(iterator)
             except StopIteration:
@@ -390,7 +353,12 @@ def _decode_frame(frame: GrayFrame, profile: Profile) -> Iterator[bytes]:
                 yield packet
 
 
-def read_video(source: Path, *, profile: Profile = CONSERVATIVE) -> Generator[bytes, None, None]:
+def read_video(
+    source: Path,
+    *,
+    profile: Profile = CONSERVATIVE,
+    on_progress: Callable[[int], None] | None = None,
+) -> Generator[bytes, None, None]:
     _validate_profile(profile)
     try:
         source = source.resolve()
@@ -431,10 +399,23 @@ def read_video(source: Path, *, profile: Profile = CONSERVATIVE) -> Generator[by
         ],
         writing=False,
     )
+    count = 0
+    previous: bytearray | None = None
+    previous_packets: tuple[bytes, ...] | None = None
     try:
         while (raw := process.read_frame(width * height)) is not None:
+            count += 1
+            if on_progress is not None:
+                on_progress(count)
+            if raw == previous:
+                continue
+            previous = raw
             frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width)
-            yield from _decode_frame(frame, profile)
+            packets = tuple(_decode_frame(frame, profile))
+            if packets == previous_packets:
+                continue
+            previous_packets = packets
+            yield from packets
         process.finish()
     finally:
         process.close()

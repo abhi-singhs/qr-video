@@ -12,6 +12,7 @@ from typing import BinaryIO
 from qr_video.errors import QRVideoError
 
 KEY_SIZE = 32
+KEY_ALPHABET = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 
 def _canonical_output(path: Path) -> Path:
@@ -104,15 +105,15 @@ def open_input(path: Path) -> Iterator[BinaryIO]:
 
 
 def read_key(path: Path) -> bytes:
-    """Read exactly 32 raw bytes, not a password, hex string, or encoded key."""
+    """Read a non-empty raw key."""
     with open_input(path) as stream:
-        key = stream.read(KEY_SIZE + 1)
-    if len(key) != KEY_SIZE:
-        raise QRVideoError(f"Key must contain exactly {KEY_SIZE} raw bytes: {path}")
+        key = stream.read()
+    if not key:
+        raise QRVideoError(f"Key file must not be empty: {path}")
     return key
 
 
 def generate_key(path: Path) -> None:
-    """Generate and atomically publish a private key without replacing any file."""
+    """Generate and atomically publish a private alphanumeric key."""
     with atomic_output(path) as stream:
-        stream.write(secrets.token_bytes(KEY_SIZE))
+        stream.write(bytes(secrets.choice(KEY_ALPHABET) for _ in range(KEY_SIZE)))

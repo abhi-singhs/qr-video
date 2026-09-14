@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import shutil
@@ -13,6 +14,11 @@ from qr_video.profiles import Profile
 from qr_video.transport import SHARD_SIZE
 
 VIDEO_AVAILABLE = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
+
+class TTYBuffer(io.StringIO):
+    def isatty(self) -> bool:
+        return True
 
 
 def cli(
@@ -52,12 +58,15 @@ def test_keygen_and_stats(tmp_path: Path) -> None:
     key = tmp_path / "secret.key"
     cli("keygen", "--out", key)
     assert len(key.read_bytes()) == 32
+    assert key.read_text(encoding="ascii").isalnum()
     original_key = key.read_bytes()
     cli("keygen", "--out", key, success=False)
     assert key.read_bytes() == original_key
     source = tmp_path / "input.bin"
     source.write_bytes(b"\x00\xff" * 1024)
-    stats = json.loads(cli("stats", source, "--key-file", key, "--compress").stdout)
+    stats = json.loads(
+        cli("stats", source, "--key", key.read_text(encoding="ascii"), "--compress").stdout
+    )
     assert stats["encrypted"] is True
     assert stats["compressed"] is True
     assert stats["original_bytes"] == 2048
@@ -68,6 +77,53 @@ def test_keygen_and_stats(tmp_path: Path) -> None:
         2048 / stats["duration_seconds"] * 3600 / 1_000_000
     )
     assert stats["video_frames"] == stats["images"] * 3
+
+
+@pytest.mark.parametrize("command", ["encode", "stats", "decode"])
+@pytest.mark.parametrize("key", ["abhi2810", "spaces and punctuation!", "clé🔑", "x" * 100])
+def test_inline_key_parsing(command: str, key: str, tmp_path: Path) -> None:
+    arguments = [command, str(tmp_path / "input"), "--key", key]
+    if command != "stats":
+        arguments.extend(["--out", str(tmp_path / "output")])
+    assert cli_module.parser().parse_args(arguments).key == key.encode("utf-8")
+
+
+def test_empty_inline_key_is_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "input"
+    source.write_bytes(b"data")
+    result = cli("stats", source, "--key", "", success=False)
+    assert "key must not be empty" in result.stderr
+
+
+def test_progress_renders_percent_and_frame_count() -> None:
+    stream = TTYBuffer()
+    encoding = cli_module._Progress("Encoding", "QR images", total=4, stream=stream)
+    encoding.update(2)
+    encoding.update(4)
+    encoding.close()
+    decoding = cli_module._Progress("Decoding", "video frames", stream=stream)
+    decoding.update(7)
+    decoding.close()
+    output = stream.getvalue()
+    assert "Encoding:  50% (2/4 QR images)" in output
+    assert "Encoding: 100% (4/4 QR images)" in output
+    assert "Decoding: \\ 7 video frames" in output
+
+
+def test_progress_is_silent_when_stderr_is_not_a_tty() -> None:
+    stream = io.StringIO()
+    progress = cli_module._Progress("Encoding", "QR images", total=1, stream=stream)
+    progress.update(1)
+    progress.close()
+    assert stream.getvalue() == ""
+
+
+def test_inline_key_and_key_file_are_mutually_exclusive(tmp_path: Path) -> None:
+    source = tmp_path / "input"
+    source.write_bytes(b"data")
+    key = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"
+    result = cli("stats", source, "--key", key, "--key-file", source, success=False)
+    assert "not allowed with argument" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -106,9 +162,10 @@ def test_path_and_key_errors(tmp_path: Path) -> None:
     cli("encode", key, "--out", tmp_path / "key.mp4", "--key-file", key, success=False)
     assert key.read_bytes() == key_before
     bad_key = tmp_path / "bad.key"
-    bad_key.write_bytes(b"invalid")
+    bad_key.write_bytes(b"")
     output = tmp_path / "invalid.mp4"
-    cli("encode", source, "--out", output, "--key-file", bad_key, success=False)
+    result = cli("encode", source, "--out", output, "--key-file", bad_key, success=False)
+    assert "must not be empty" in result.stderr
     cli("encode", source, "--out", output, "--key-file", tmp_path / "missing.key", success=False)
     assert not output.exists()
     output.write_bytes(b"keep output")
@@ -143,6 +200,7 @@ def test_output_directory_alias_is_frozen_before_encoding(
         *,
         profile: Profile,
         crf: int,
+        on_progress: object,
     ) -> int:
         count = sum(1 for _ in packets)
         destination.write_bytes(b"complete video fixture")
@@ -197,7 +255,7 @@ def test_full_cli_roundtrip(tmp_path: Path, kind: str, encrypted: bool) -> None:
     if encrypted:
         key = tmp_path / "secret.key"
         cli("keygen", "--out", key)
-        key_args = ["--key-file", key]
+        key_args = ["--key", key.read_text(encoding="ascii")]
     compression = ["--compress"] if kind == "compressible" else []
     encoded = cli("encode", source, "--out", output, *key_args, *compression)
     stats = json.loads(encoded.stderr.splitlines()[0])

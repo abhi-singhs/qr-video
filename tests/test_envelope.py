@@ -127,6 +127,15 @@ def test_round_trip(tmp_path: Path, encrypted: bool, compressed: bool, size: int
         assert recovered.stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.parametrize("key", [b"x", b"abhi2810", b"punctuation! and spaces", b"x" * 100])
+def test_variable_length_keys_round_trip(tmp_path: Path, key: bytes) -> None:
+    source, stored, recovered = tmp_path / "source", tmp_path / "stored", tmp_path / "recovered"
+    source.write_bytes(b"secret payload")
+    encode_envelope(source, stored, key=key)
+    decode_envelope(stored, recovered, key=key)
+    assert recovered.read_bytes() == source.read_bytes()
+
+
 def test_info_is_frozen(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.write_bytes(b"data")
@@ -206,14 +215,14 @@ def test_missing_or_wrong_key_never_publishes(
     assert set(tmp_path.iterdir()) == {source, stored}
 
 
-@pytest.mark.parametrize("bad_key", [b"", b"x" * 31, b"x" * 33, "x" * 32, bytearray(32)])
+@pytest.mark.parametrize("bad_key", [b"", "x" * 32, bytearray(32)])
 def test_malformed_keys_fail_before_output(tmp_path: Path, bad_key: bytes) -> None:
     source, stored, output = tmp_path / "source", tmp_path / "stored", tmp_path / "output"
     source.write_bytes(b"secret")
-    with pytest.raises(QRVideoError, match="exactly 32"):
+    with pytest.raises(QRVideoError, match="non-empty bytes"):
         encode_envelope(source, output, key=bad_key)
     encode_envelope(source, stored, key=KEY)
-    with pytest.raises(QRVideoError, match="exactly 32"):
+    with pytest.raises(QRVideoError, match="non-empty bytes"):
         decode_envelope(stored, output, key=bad_key)
     assert set(tmp_path.iterdir()) == {source, stored}
 

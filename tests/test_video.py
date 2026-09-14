@@ -13,7 +13,6 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import zxingcpp
-from qrcode.util import MODE_8BIT_BYTE, QRData
 
 from qr_video import video
 from qr_video.errors import QRVideoError
@@ -60,21 +59,8 @@ def test_render_preserves_raw_binary_packets() -> None:
 @pytest.mark.parametrize(
     "packet", [b"A" * 382, b"1" * 382, b"\x00" * 382], ids=["letters", "digits", "nul"]
 )
-def test_capacity_accepts_382_bytes_in_forced_byte_mode(
-    packet: bytes, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    modes: list[int] = []
-    original = video.qrcode.QRCode.add_data
-
-    def add_data(qr: Any, data: QRData, optimize: int = 20) -> None:
-        modes.append(data.mode)
-        assert data.data == packet
-        assert optimize == 0
-        original(qr, data, optimize=optimize)
-
-    monkeypatch.setattr(video.qrcode.QRCode, "add_data", add_data)
+def test_capacity_accepts_382_bytes_in_forced_byte_mode(packet: bytes) -> None:
     frame = render_frame(packet, None)
-    assert modes == [MODE_8BIT_BYTE]
     assert list(video._decode_frame(frame, CONSERVATIVE)) == [packet]
 
 
@@ -84,17 +70,6 @@ def test_capacity_accepts_382_bytes_in_forced_byte_mode(
 def test_capacity_rejects_383_bytes_without_text_optimization(packet: bytes) -> None:
     with pytest.raises(QRVideoError, match="383 bytes; maximum is 382"):
         render_frame(packet, None)
-
-
-@pytest.mark.parametrize("length", [0, 1, 15, 16, 100, 381, 382])
-def test_zero_safe_codewords_match_the_qrcode_encoder(length: int) -> None:
-    packet = random.Random(317).randbytes(length)
-    expected = video.qrcode.util.create_data(
-        CONSERVATIVE.version,
-        video.qrcode.constants.ERROR_CORRECT_H,
-        [QRData(packet, mode=MODE_8BIT_BYTE)],
-    )
-    assert video._zero_safe_codewords(packet, CONSERVATIVE) == expected
 
 
 @pytest.mark.parametrize("length", [16, 30, 100, 381, 382])
@@ -156,9 +131,11 @@ def test_render_rejects_invalid_profiles(profile: Profile) -> None:
 
 
 def test_render_checks_qr_dimensions(monkeypatch: pytest.MonkeyPatch) -> None:
-    qr = MagicMock()
-    qr.make_image.return_value.convert.return_value = np.ones((300, 300), dtype=np.uint8)
-    monkeypatch.setattr(video.qrcode, "QRCode", lambda **kwargs: qr)
+    monkeypatch.setattr(
+        video.zxingcpp,
+        "write_barcode_to_image",
+        lambda *args, **kwargs: np.ones((300, 300), dtype=np.uint8),
+    )
     with pytest.raises(QRVideoError, match="dimensions"):
         render_frame(b"packet", None)
 
@@ -204,6 +181,15 @@ def test_write_rejects_empty_packets(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     monkeypatch.setattr(video, "_executable", lambda name: sys.executable)
     with pytest.raises(QRVideoError, match="without QR packets"):
         write_video([], tmp_path / "empty.mp4")
+
+
+def test_write_reports_each_completed_qr_image(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_codec(monkeypatch, "import sys\nsys.stdin.buffer.read()\n")
+    completed: list[int] = []
+    assert write_video(_packets(5), tmp_path / "progress.mp4", on_progress=completed.append) == 3
+    assert completed == [1, 2, 3]
 
 
 def test_write_never_overwrites_an_existing_destination(tmp_path: Path) -> None:
@@ -388,6 +374,60 @@ def test_read_rejects_a_truncated_raw_frame(
     assert children[0].poll() is not None
 
 
+def test_read_reports_each_scanned_video_frame(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.touch()
+    _fake_codec(
+        monkeypatch,
+        "import sys\nsys.stdout.buffer.write(b'\\xff' * (640 * 360 * 2))\n",
+    )
+    monkeypatch.setattr(video, "_decode_frame", lambda frame, profile: iter(()))
+    completed: list[int] = []
+    assert list(read_video(source, on_progress=completed.append)) == []
+    assert completed == [1, 2]
+
+
+def test_read_skips_only_pixel_identical_consecutive_frames(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.touch()
+    _fake_codec(
+        monkeypatch,
+        "import sys\n"
+        "frame = b'\\xff' * (640 * 360)\n"
+        "sys.stdout.buffer.write(frame + frame + b'\\x00' + frame[1:])\n",
+    )
+    scanned: list[int] = []
+
+    def decode(frame: np.ndarray[Any, np.dtype[np.uint8]], profile: Profile) -> Iterator[bytes]:
+        scanned.append(int(frame[0, 0]))
+        return iter([bytes([frame[0, 0]])])
+
+    monkeypatch.setattr(video, "_decode_frame", decode)
+    completed: list[int] = []
+    assert list(read_video(source, on_progress=completed.append)) == [b"\xff", b"\x00"]
+    assert scanned == [255, 0]
+    assert completed == [1, 2, 3]
+
+
+def test_read_skips_repeated_packets_from_pixel_different_frames(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.touch()
+    _fake_codec(
+        monkeypatch,
+        "import sys\n"
+        "frame = b'\\xff' * (640 * 360)\n"
+        "sys.stdout.buffer.write(frame + b'\\x00' + frame[1:])\n",
+    )
+    monkeypatch.setattr(video, "_decode_frame", lambda frame, profile: iter([b"packet"]))
+    assert list(read_video(source)) == [b"packet"]
+
+
 def test_read_reports_codec_failure_even_after_valid_frames(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -507,13 +547,7 @@ def test_lossy_h264_round_trip_and_actual_frame_count(
     assert (metadata["width"], metadata["height"]) == (640, 360)
     assert metadata["avg_frame_rate"] == "30/1"
     assert int(metadata["nb_read_frames"]) == count * CONSERVATIVE.repeat
-    expected = [
-        packet
-        for start in range(0, len(packets), 2)
-        for _ in range(CONSERVATIVE.repeat)
-        for packet in packets[start : start + 2]
-    ]
-    assert list(read_video(destination)) == expected
+    assert list(read_video(destination)) == packets
 
 
 @pytest.mark.video

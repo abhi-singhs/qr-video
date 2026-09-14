@@ -2,7 +2,7 @@
 
 A local Python CLI that carries arbitrary binary files in visible QR-code MP4
 videos. The decoder reconstructs the file from a local video. Optional AES-256-GCM
-encryption requires a separate key file.
+encryption accepts a key value or a separate key file.
 
 **This is an experimental storage transport, not a backup replacement.**
 YouTube survival is untested. A successful local H.264 transcode does not prove
@@ -39,23 +39,25 @@ With encryption:
 
 ```sh
 qr-video keygen --out secret.key
-qr-video encode input.bin --out encoded.mp4 --key-file secret.key
-qr-video decode encoded.mp4 --out recovered.bin --key-file secret.key
+KEY="$(cat secret.key)"
+qr-video encode input.bin --out encoded.mp4 --key "$KEY"
+qr-video decode encoded.mp4 --out recovered.bin --key "$KEY"
 ```
 
 Compression is optional and happens before encryption. The envelope records the
 choice, so decoding needs no compression flag:
 
 ```sh
-qr-video encode input.bin --out encoded.mp4 --compress --key-file secret.key
-qr-video decode encoded.mp4 --out recovered.bin --key-file secret.key
+qr-video encode input.bin --out encoded.mp4 --compress --key "$KEY"
+qr-video decode encoded.mp4 --out recovered.bin --key "$KEY"
 ```
 
 Get exact size and timing estimates without generating QR images:
 
 ```sh
 qr-video stats input.bin
-qr-video stats input.bin --compress --key-file secret.key
+qr-video stats input.bin --compress --key "$KEY"
+unset KEY
 ```
 
 `stats` streams the input into a private temporary envelope to measure compression
@@ -63,6 +65,10 @@ and encryption overhead. It prints JSON to stdout. `encode` prints the same
 statistics to stderr before generating video. `application_mb_per_hour` uses
 the original file size and the actual scheduled video duration. MB means
 1,000,000 bytes. Empty files report zero application MB/hour.
+
+In an interactive terminal, `encode` shows the completed percentage and QR image
+count. `decode` shows the number of video frames scanned. Redirected output and
+non-interactive processes do not receive progress updates.
 
 Every command returns a nonzero exit code on failure. Outputs appear only after
 completion and verification. Existing outputs require `--overwrite`. Input and
@@ -73,12 +79,20 @@ before processing, so retargeting a directory alias cannot redirect publication.
 Default no-clobber publication requires hard-link support in the output
 filesystem. Unsupported filesystems fail explicitly.
 
-## Keep the key separate
+## Keep the key private
 
-`keygen` uses operating-system randomness to generate exactly 32 binary bytes.
-On POSIX systems, the key file has mode `0600`. The key is never a command-line
-argument or part of the video. Pass its path through `--key-file`; do not paste
-the key into a terminal command, chat, README, or issue.
+`keygen` uses operating-system randomness to generate exactly 32 ASCII letters
+and digits with no trailing newline. On POSIX systems, the key file has mode
+`0600`. This is the recommended way to create a key, but it is not a required
+format. `--key` accepts any non-empty text and encodes it as UTF-8. `--key-file`
+accepts any non-empty raw file. The options are mutually exclusive. The key is
+never part of the video.
+
+An inline key appears in the process arguments while the command runs. A literal
+key may also remain in shell history. Expanding a shell variable avoids storing
+the value in the command text, but it does not remove it from the process
+arguments. Prefer `--key-file` on shared systems. Do not paste a real key into
+chat, a README, or an issue.
 
 Losing the key prevents decryption. Back it up separately from the video.
 An unlisted YouTube video is not access control. Without encryption, anyone
@@ -86,8 +100,8 @@ with a readable video can recover the file. Encryption does not conceal the
 presence of a transfer, its encoded size, or the QR transport parameters.
 Compression can reveal information through the resulting size.
 
-The decoder rejects a plaintext envelope when you pass `--key-file`. It does
-not ignore the key and accept an unauthenticated replacement.
+The decoder rejects a plaintext envelope when you pass `--key` or `--key-file`.
+It does not ignore the key and accept an unauthenticated replacement.
 
 Temporary directories are private. The decoder may write transient plaintext to
 a restrictive temporary file while authenticating the stream. It publishes the
@@ -257,7 +271,7 @@ transfer when needed. Framing counts against the envelope limit, so an
 uncompressed source at exactly 64 GiB cannot fit:
 
 ```sh
-qr-video decode encoded.mp4 --out recovered.bin --key-file secret.key \
+qr-video decode encoded.mp4 --out recovered.bin --key "$KEY" \
   --max-bytes 4294967296
 ```
 
@@ -281,10 +295,9 @@ or 8,294,400 total pixels.
 
 ## Local validation
 
-On September 14, 2026, all 320 tests passed on macOS with Python 3.13.14 and
-FFmpeg 8.1.1. Ruff, mypy, and wheel/source builds also passed. The installed Python
-dependencies included cryptography 48.0.1, NumPy 2.5.3, qrcode 8.2,
-zfec 1.6.0.0, and zxing-cpp 3.1.1.
+On September 14, 2026, all 336 tests passed on macOS with Python 3.13.14 and
+FFmpeg 8.1.1. Ruff and mypy also passed. The installed Python dependencies
+included cryptography 48.0.1, NumPy 2.5.3, zfec 1.6.0.0, and zxing-cpp 3.1.1.
 
 The CLI roundtrips cover empty files, all byte values including NUL and non-UTF8
 bytes, compressible data, random incompressible data, and three-block files.
@@ -313,16 +326,17 @@ from the remaining 100. Removing 26 leaves only 99 and fails without output.
 These tests call the outer erasure decoder directly, so QR-H correction cannot
 hide a broken missing-packet recovery implementation.
 
-A separate full-video run recovered an encrypted 1,048,591-byte random file
-through 31 coding blocks and two authenticated data records. The 6,330-frame
-MP4 lasted 211 seconds. Encode plus decode took about 130 seconds on this
-machine. The MP4 occupied about 152 MB. Payload density measures data per video
-duration, not storage efficiency of the MP4 itself.
+A same-size synthetic benchmark encoded 1,347,325 random bytes in 15.3 seconds
+on this machine. The 8,136-frame MP4 lasts 271.2 seconds and occupies 194.7 MB.
+The native ZXing writer rendered each two-code image in 2.17 ms. The previous
+Python writer took 58.8 ms, so QR rendering was about 27 times faster in this
+benchmark. Payload density measures data per video duration, not storage
+efficiency of the MP4 itself.
 
-The QR tests also cover 382 NUL bytes through both lossy encodes. qrcode 8.2
-raises `glog(0)` for an all-zero internal Reed-Solomon data block. The wrapper
-handles that specific case with zero parity for a zero block. It uses qrcode
-for nonzero blocks and checks the result against ordinary library codewords.
+The QR tests also cover 382 NUL bytes through both lossy encodes. The encoder
+uses ZXing's native QR writer with ECI disabled, which preserves the full raw
+byte-mode capacity. Tests cover all-zero, all-byte-value, and random packets at
+the 382-byte limit.
 
 These are local observations. No authorized YouTube upload/transcode/download
 roundtrip has occurred.

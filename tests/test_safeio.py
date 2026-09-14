@@ -6,7 +6,7 @@ import pytest
 
 from qr_video import safeio
 from qr_video.errors import QRVideoError
-from qr_video.safeio import atomic_output, check_output, generate_key, read_key
+from qr_video.safeio import KEY_ALPHABET, atomic_output, check_output, generate_key, read_key
 
 
 def test_generated_keys_are_complete_and_distinct(tmp_path: Path) -> None:
@@ -14,6 +14,8 @@ def test_generated_keys_are_complete_and_distinct(tmp_path: Path) -> None:
     generate_key(first)
     generate_key(second)
     assert len(read_key(first)) == 32
+    assert set(first.read_bytes()) <= set(KEY_ALPHABET)
+    assert set(second.read_bytes()) <= set(KEY_ALPHABET)
     assert read_key(first) != read_key(second)
     assert sorted(path.name for path in tmp_path.iterdir()) == ["first.key", "second.key"]
     if os.name == "posix":
@@ -29,11 +31,17 @@ def test_key_generation_never_overwrites(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == [key]
 
 
-@pytest.mark.parametrize("size", [0, 1, 31, 33, 64, 1024 * 1024])
-def test_invalid_key_sizes(tmp_path: Path, size: int) -> None:
+@pytest.mark.parametrize("size", [1, 31, 32, 33, 64, 1024 * 1024])
+def test_variable_key_sizes(tmp_path: Path, size: int) -> None:
     key = tmp_path / "key"
     key.write_bytes(b"x" * size)
-    with pytest.raises(QRVideoError, match="exactly 32 raw bytes"):
+    assert read_key(key) == b"x" * size
+
+
+def test_empty_key_file_is_rejected(tmp_path: Path) -> None:
+    key = tmp_path / "key"
+    key.write_bytes(b"")
+    with pytest.raises(QRVideoError, match="must not be empty"):
         read_key(key)
 
 
