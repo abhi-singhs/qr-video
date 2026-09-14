@@ -4,11 +4,6 @@ A local Python CLI that carries arbitrary binary files in visible QR-code MP4
 videos. The decoder reconstructs the file from a local video. Optional AES-256-GCM
 encryption accepts a key value or a separate key file.
 
-**This is an experimental storage transport, not a backup replacement.**
-YouTube survival is untested. A successful local H.264 transcode does not prove
-that YouTube will preserve the QR codes. This project has no upload, download,
-YouTube, or web service integration.
-
 ## Install
 
 Use Python 3.11 or newer and FFmpeg with the `libx264` encoder. Both `ffmpeg` and
@@ -94,8 +89,7 @@ the value in the command text, but it does not remove it from the process
 arguments. Prefer `--key-file` on shared systems. Do not paste a real key into
 chat, a README, or an issue.
 
-Losing the key prevents decryption. Back it up separately from the video.
-An unlisted YouTube video is not access control. Without encryption, anyone
+Losing the key prevents decryption. Back it up separately from the video. Without encryption, anyone
 with a readable video can recover the file. Encryption does not conceal the
 presence of a transfer, its encoded size, or the QR transport parameters.
 Compression can reveal information through the resulting size.
@@ -337,9 +331,6 @@ The QR tests also cover 382 NUL bytes through both lossy encodes. The encoder
 uses ZXing's native QR writer with ECI disabled, which preserves the full raw
 byte-mode capacity. Tests cover all-zero, all-byte-value, and random packets at
 the 382-byte limit.
-
-These are local observations. No authorized YouTube upload/transcode/download
-roundtrip has occurred.
 
 ## Development
 
