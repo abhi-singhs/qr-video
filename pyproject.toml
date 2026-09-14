@@ -1,13 +1,30 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.27,<1.32"]
 build-backend = "hatchling.build"
 
 [project]
 name = "qr-video"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Local binary-file transport in QR-code videos with optional authenticated encryption"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["binary-transfer", "encryption", "qr-code", "reed-solomon", "video"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Communications :: File Sharing",
+  "Topic :: Multimedia :: Video",
+  "Topic :: Security :: Cryptography",
+]
 dependencies = [
   "cryptography>=44,<49",
   "numpy>=2.1,<3",
@@ -21,10 +38,21 @@ dev = [
   "mypy>=1.15",
   "pytest>=8.3",
   "ruff>=0.11",
+  "twine>=6.1,<7",
 ]
 
 [project.scripts]
 qr-video = "qr_video.cli:main"
+
+[project.urls]
+Repository = "https://github.com/abhi-singhs/qr-video"
+Issues = "https://github.com/abhi-singhs/qr-video/issues"
+
+[tool.hatch.version]
+path = "src/qr_video/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/AGENTS.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

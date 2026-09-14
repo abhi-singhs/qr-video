@@ -341,6 +341,7 @@ pytest -q
 ruff check .
 mypy src/qr_video
 python -m build
+twine check dist/*
 ```
 
 Tests generate random keys and non-sensitive fixtures in temporary directories.
