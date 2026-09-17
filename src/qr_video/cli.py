@@ -3,12 +3,14 @@ import json
 import shutil
 import sys
 import tempfile
+from collections.abc import Sequence
 from contextlib import closing
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TextIO
 
 from qr_video import __version__
+from qr_video.batch import BatchNotice, prepare_batch
 from qr_video.envelope import EnvelopeInfo, decode_envelope, encode_envelope
 from qr_video.errors import QRVideoError
 from qr_video.profiles import CONSERVATIVE, Profile
@@ -20,6 +22,7 @@ from qr_video.safeio import (
 )
 from qr_video.transport import (
     DEFAULT_MAX_BYTES,
+    MAX_STREAM_SIZE,
     Manifest,
     encode_packets,
     prepare_manifest,
@@ -85,6 +88,31 @@ def _add_key_arguments(command: argparse.ArgumentParser) -> None:
     keys.add_argument("--key-file", type=Path, help="Read a non-empty raw key from a file")
 
 
+def _add_path_arguments(
+    command: argparse.ArgumentParser, *, input_help: str, output_help: str, decode: bool = False
+) -> None:
+    sources = command.add_mutually_exclusive_group(required=True)
+    sources.add_argument("input", nargs="?", type=Path, help=input_help)
+    sources.add_argument(
+        "--input-dir",
+        type=Path,
+        help=(
+            "Decode top-level .mp4 files; requires --out-dir"
+            if decode else "Encode top-level files; requires --out-dir"
+        ),
+    )
+    outputs = command.add_mutually_exclusive_group(required=True)
+    outputs.add_argument("--out", type=Path, help=output_help)
+    outputs.add_argument(
+        "--out-dir",
+        type=Path,
+        help=(
+            "Output folder, created if missing; remove the final .mp4 from each name"
+            if decode else "Output folder, created if missing; append .mp4 to each filename"
+        ),
+    )
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="qr-video",
@@ -103,7 +131,12 @@ def parser() -> argparse.ArgumentParser:
             else ("Calculate exact framing, duration and payload rate without writing video")
         )
         sub = commands.add_parser(command, help=help_text)
-        sub.add_argument("input", type=Path, help="Local binary input file")
+        if command == "encode":
+            _add_path_arguments(
+                sub, input_help="Local binary input file", output_help="Output MP4 path"
+            )
+        else:
+            sub.add_argument("input", type=Path, help="Local binary input file")
         _add_key_arguments(sub)
         sub.add_argument(
             "--compress", action="store_true", help="Compress with zlib before encryption"
@@ -119,14 +152,17 @@ def parser() -> argparse.ArgumentParser:
         )
         sub.add_argument("--interleave", type=int, default=4, help="Interleaved blocks, 1 to 16")
         if command == "encode":
-            sub.add_argument("--out", required=True, type=Path, help="Output MP4 path")
             sub.add_argument(
                 "--overwrite", action="store_true", help="Replace an existing output file"
             )
             sub.add_argument("--crf", type=int, default=18, help="H.264 CRF, 0 to 51, default 18")
     decode = commands.add_parser("decode", help="Recover a binary file from a local video")
-    decode.add_argument("input", type=Path, help="Local input video")
-    decode.add_argument("--out", required=True, type=Path, help="Recovered binary output path")
+    _add_path_arguments(
+        decode,
+        input_help="Local input video",
+        output_help="Recovered binary output path",
+        decode=True,
+    )
     _add_key_arguments(decode)
     decode.add_argument(
         "--overwrite", action="store_true", help="Replace output only after verification"
@@ -140,15 +176,14 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def _input_and_key(args: argparse.Namespace) -> tuple[Path, bytes | None]:
+def _input(args: argparse.Namespace) -> Path:
     source: Path = args.input
     if not source.is_file():
         raise QRVideoError(f"Input is not a regular file: {source}")
     key_file: Path | None = args.key_file
     if key_file is not None and key_file.exists() and source.samefile(key_file):
         raise QRVideoError("Input and key file must be different files")
-    key: bytes | None = args.key
-    return source, read_key(key_file) if key_file is not None else key
+    return source
 
 
 def _profile(args: argparse.Namespace) -> Profile:
@@ -160,12 +195,14 @@ def _profile(args: argparse.Namespace) -> Profile:
     return profile
 
 
-def _check_destination(args: argparse.Namespace, source: Path) -> None:
+def _check_destination(
+    args: argparse.Namespace, source: Path, *, protected: Sequence[Path] = ()
+) -> None:
     args.out = args.out.parent.resolve(strict=True) / args.out.name
-    protected = [source]
+    protected_paths = [source, *protected]
     if args.key_file is not None:
-        protected.append(args.key_file)
-    check_output(args.out, overwrite=args.overwrite, protected=protected)
+        protected_paths.append(args.key_file)
+    check_output(args.out, overwrite=args.overwrite, protected=protected_paths)
 
 
 def _statistics(
@@ -194,11 +231,16 @@ def _statistics(
     return stats
 
 
-def _encode_or_stats(args: argparse.Namespace) -> None:
-    profile = _profile(args)
-    source, key = _input_and_key(args)
+def _encode_or_stats(
+    args: argparse.Namespace,
+    *,
+    key: bytes | None,
+    profile: Profile,
+    protected: Sequence[Path] = (),
+) -> None:
+    source = _input(args)
     if args.command == "encode":
-        _check_destination(args, source)
+        _check_destination(args, source, protected=protected)
     with tempfile.TemporaryDirectory(prefix="qr-video-encode-") as directory:
         workspace = Path(directory).resolve()
         envelope = workspace / "stream.qve"
@@ -239,9 +281,11 @@ def _encode_or_stats(args: argparse.Namespace) -> None:
     print(f"Encoded {info.original_size} bytes to {args.out}")
 
 
-def _decode(args: argparse.Namespace) -> None:
-    source, key = _input_and_key(args)
-    _check_destination(args, source)
+def _decode(
+    args: argparse.Namespace, *, key: bytes | None, protected: Sequence[Path] = ()
+) -> None:
+    source = _input(args)
+    _check_destination(args, source, protected=protected)
     with tempfile.TemporaryDirectory(prefix="qr-video-decode-") as directory:
         envelope = Path(directory).resolve() / "stream.qve"
         progress = _Progress("Decoding", "video frames")
@@ -261,16 +305,81 @@ def _decode(args: argparse.Namespace) -> None:
     print(f"Recovered {info.original_size} bytes to {args.out}; SHA-256 {info.sha256}")
 
 
+def _run_batch(
+    args: argparse.Namespace, *, key: bytes | None, profile: Profile | None
+) -> int:
+    if args.command == "decode" and not 1 <= args.max_bytes <= MAX_STREAM_SIZE:
+        raise QRVideoError(f"max_bytes must be an integer from 1 to {MAX_STREAM_SIZE}.")
+    plan = prepare_batch(
+        args.input_dir,
+        args.out_dir,
+        decode=args.command == "decode",
+        key_file=args.key_file,
+    )
+    for notice in plan.skipped:
+        print(f"Skipped {notice.source}: {notice.reason}", file=sys.stderr)
+    if not plan.items and not plan.failures:
+        raise QRVideoError(f"No eligible input files found in {args.input_dir}")
+
+    failures = list(plan.failures)
+    completed: list[Path] = []
+    for index, item in enumerate(plan.items, start=1):
+        print(
+            f"[{index}/{len(plan.items)}] {item.source} -> {item.destination}",
+            file=sys.stderr,
+            flush=True,
+        )
+        file_args = argparse.Namespace(**vars(args))
+        file_args.input = item.source
+        file_args.out = item.destination
+        protected = (*plan.protected, *completed)
+        try:
+            if profile is not None:
+                _encode_or_stats(file_args, key=key, profile=profile, protected=protected)
+            else:
+                _decode(file_args, key=key, protected=protected)
+        except (QRVideoError, OSError) as exc:
+            failures.append(BatchNotice(item.source, str(exc)))
+            print(f"Failed {item.source}: {exc}", file=sys.stderr, flush=True)
+        else:
+            completed.append(item.destination)
+    print(
+        f"Batch complete: {len(completed)} succeeded, {len(failures)} failed, "
+        f"{len(plan.skipped)} skipped"
+    )
+    if failures:
+        print("Failed files:", file=sys.stderr)
+        for notice in failures:
+            print(f"  {notice.source}: {notice.reason}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
+    arguments = parser()
+    args = arguments.parse_args(argv)
+    if args.command in ("encode", "decode") and (
+        (args.input_dir is None) != (args.out_dir is None)
+    ):
+        arguments.error("Use INPUT with --out, or --input-dir with --out-dir")
     try:
         if args.command == "keygen":
             generate_key(args.out)
             print(f"Created key file {args.out}. Keep it private; losing it prevents decryption.")
-        elif args.command in ("encode", "stats"):
-            _encode_or_stats(args)
         else:
-            _decode(args)
+            profile = _profile(args) if args.command in ("encode", "stats") else None
+            batch = args.command != "stats" and args.input_dir is not None
+            if not batch:
+                _input(args)
+            key: bytes | None = (
+                read_key(args.key_file) if args.key_file is not None else args.key
+            )
+            if batch:
+                return _run_batch(args, key=key, profile=profile)
+            if profile is not None:
+                _encode_or_stats(args, key=key, profile=profile)
+            else:
+                _decode(args, key=key)
     except (QRVideoError, OSError) as exc:
         print(f"qr-video: {exc}", file=sys.stderr)
         return 1
