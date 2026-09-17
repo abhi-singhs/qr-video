@@ -74,6 +74,58 @@ before processing, so retargeting a directory alias cannot redirect publication.
 Default no-clobber publication requires hard-link support in the output
 filesystem. Unsupported filesystems fail explicitly.
 
+## Process folders
+
+Encode every regular file at the top level of a folder, then recover the files
+into another folder:
+
+```sh
+qr-video encode --input-dir incoming --out-dir videos --compress
+qr-video decode --input-dir videos --out-dir recovered
+```
+
+For example, `incoming/report.pdf` becomes `videos/report.pdf.mp4`, then
+`recovered/report.pdf`. Encoding appends `.mp4` to the complete filename.
+Decoding removes only that final suffix. This preserves extensions, including
+multiple extensions such as `.tar.gz`. An input named `clip.mp4` becomes
+`clip.mp4.mp4` and recovers as `clip.mp4`.
+
+The video filename carries the original name. The envelope still stores no
+filename. If you rename the video, folder decoding uses the new name without
+its final `.mp4`. It cannot recover a forgotten filename. Use the single-file
+decoder with `--out` when you need to choose the recovered name.
+
+Use `--input-dir` with `--out-dir` instead of the positional input and `--out`.
+The CLI creates missing output folders and their parents. Input and output
+folders must resolve to different directories. An output subfolder inside the
+input folder is allowed because processing does not recurse.
+
+The CLI takes one snapshot of the input folder and processes files in filename
+order. It includes hidden files and symlinks to regular files. It skips
+subdirectories and other non-regular entries. Folder decoding accepts only
+filenames ending in `.mp4`, ignoring the case of that suffix, and reports other
+files as skipped. An empty folder or a folder with no eligible files is an
+error. `stats` remains a single-file command.
+
+All existing encoding and decoding options apply per file. Add the same
+`--key-file secret.key` or `--key` option to both commands for encryption.
+The CLI reads the selected key once and skips that key file and its aliases
+if they appear in the input folder. It reports each skipped entry.
+The decoder applies `--max-bytes` to each file, not to the batch total.
+
+Each output appears only after that file completes and passes verification.
+`--overwrite` permits replacing existing destinations, but never an input, the
+selected key, or another output produced in the same batch. Without it, an
+existing destination counts as a file failure. Conflicting output names also
+count as failures.
+
+The CLI continues after individual file failures and keeps completed outputs.
+It finishes with success, failure, and skip counts, plus a list of failed files
+and their errors. Any file failure produces exit code 1. Invalid shared options
+or unusable folder paths stop the batch before processing. Interruption stops
+processing and returns 130. Failures leave no partial output files, though an
+automatically created output folder may remain empty.
+
 ## Keep the key private
 
 `keygen` uses operating-system randomness to generate exactly 32 ASCII letters

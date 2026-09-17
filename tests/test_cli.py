@@ -46,6 +46,36 @@ def test_help(command: str) -> None:
     assert "usage:" in cli(command, "--help").stdout
 
 
+@pytest.mark.parametrize("command", ["encode", "decode"])
+def test_folder_arguments(command: str, tmp_path: Path) -> None:
+    args = cli_module.parser().parse_args(
+        [command, "--input-dir", str(tmp_path), "--out-dir", str(tmp_path / "output")]
+    )
+    assert args.input_dir == tmp_path
+    assert args.out_dir == tmp_path / "output"
+    assert args.input is None
+    assert args.out is None
+
+
+@pytest.mark.parametrize("command", ["encode", "decode"])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["input", "--input-dir", "folder", "--out-dir", "output"],
+        ["input", "--out", "file", "--out-dir", "output"],
+        ["input", "--out-dir", "output"],
+        ["--input-dir", "folder", "--out", "file"],
+        ["--input-dir", "folder"],
+        ["--out-dir", "output"],
+        [],
+    ],
+)
+def test_invalid_folder_arguments(command: str, arguments: list[str]) -> None:
+    result = cli(command, *arguments, success=False)
+    assert result.returncode == 2
+    assert "usage:" in result.stderr
+
+
 def test_installed_console_entry_point() -> None:
     executable = Path(sys.executable).parent / "qr-video"
     result = subprocess.run(
@@ -173,6 +203,32 @@ def test_path_and_key_errors(tmp_path: Path) -> None:
     assert output.read_bytes() == b"keep output"
 
 
+@pytest.mark.parametrize("command", ["encode", "stats", "decode"])
+@pytest.mark.parametrize("alias", ["same", "hardlink", "symlink"])
+def test_input_key_alias_is_rejected_before_reading_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, alias: str
+) -> None:
+    source = tmp_path / "input"
+    source.write_bytes(b"do not read the transfer as a key")
+    key = source
+    if alias != "same":
+        key = tmp_path / "key"
+        if alias == "hardlink":
+            os.link(source, key)
+        else:
+            key.symlink_to(source)
+
+    def unexpected_read(path: Path) -> bytes:
+        pytest.fail("The input must be rejected before loading it as a key.")
+
+    monkeypatch.setattr(cli_module, "read_key", unexpected_read)
+    arguments = [command, str(source), "--key-file", str(key)]
+    if command != "stats":
+        arguments.extend(["--out", str(tmp_path / "output")])
+    assert cli_module.main(arguments) == 1
+    assert not (tmp_path / "output").exists()
+
+
 def test_missing_ffmpeg_is_explicit(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.write_bytes(b"test")
@@ -289,6 +345,36 @@ def test_full_cli_roundtrip(tmp_path: Path, kind: str, encrypted: bool) -> None:
     cli("decode", output, "--out", recovered, *key_args)
     assert recovered.read_bytes() == original
     assert source.read_bytes() == original
+
+
+@pytest.mark.video
+@pytest.mark.skipif(not VIDEO_AVAILABLE, reason="FFmpeg and ffprobe required")
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_folder_cli_roundtrip(tmp_path: Path, encrypted: bool) -> None:
+    source, videos, recovered = (
+        tmp_path / "source", tmp_path / "videos", tmp_path / "recovered"
+    )
+    source.mkdir()
+    originals = {
+        "report.pdf": bytes(range(256)),
+        "report.txt": b"compressible\n" * 50,
+        "archive.tar.gz": b"",
+        "clip.mp4": b"\x00\xff",
+        "caf\u00e9 notes": b"filename",
+    }
+    for name, data in originals.items():
+        (source / name).write_bytes(data)
+    options = ["--key", "batch roundtrip test key"] if encrypted else []
+    encoded = cli(
+        "encode", "--input-dir", source, "--out-dir", videos,
+        *options, *(["--compress"] if encrypted else []),
+    )
+    assert "5 succeeded, 0 failed, 0 skipped" in encoded.stdout
+    assert {path.name for path in videos.iterdir()} == {name + ".mp4" for name in originals}
+    decoded = cli("decode", "--input-dir", videos, "--out-dir", recovered, *options)
+    assert "5 succeeded, 0 failed, 0 skipped" in decoded.stdout
+    assert {path.name: path.read_bytes() for path in recovered.iterdir()} == originals
+    assert {path.name: path.read_bytes() for path in source.iterdir()} == originals
 
 
 @pytest.mark.video
